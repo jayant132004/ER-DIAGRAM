@@ -1,15 +1,95 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 import openai
 import os
 from dotenv import load_dotenv
 import json
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app, supports_credentials=True)  # Enable CORS for all routes
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'devsecret')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///app.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+
+# User model
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    queries = db.relationship('QueryHistory', backref='user', lazy=True)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+# Query history model
+class QueryHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    query = db.Column(db.Text, nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    timestamp = db.Column(db.DateTime, server_default=db.func.now())
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+@app.route('/api/signup', methods=['POST'])
+def signup():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return jsonify({'error': 'Email and password required'}), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify({'error': 'Email already registered'}), 400
+    user = User(email=email)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+    login_user(user)
+    return jsonify({'message': 'Signup successful', 'user': {'id': user.id, 'email': user.email}})
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    user = User.query.filter_by(email=email).first()
+    if user and user.check_password(password):
+        login_user(user)
+        return jsonify({'message': 'Login successful', 'user': {'id': user.id, 'email': user.email}})
+    return jsonify({'error': 'Invalid credentials'}), 401
+
+@app.route('/api/logout', methods=['POST'])
+@login_required
+def logout():
+    logout_user()
+    return jsonify({'message': 'Logged out'})
+
+@app.route('/api/history', methods=['GET'])
+@login_required
+def get_history():
+    history = QueryHistory.query.filter_by(user_id=current_user.id).order_by(QueryHistory.timestamp.desc()).all()
+    return jsonify([
+        {
+            'id': q.id,
+            'query': q.query,
+            'description': q.description,
+            'timestamp': q.timestamp.isoformat()
+        } for q in history
+    ])
 
 # Configure OpenAI (you'll need to set OPENAI_API_KEY in .env file)
 openai.api_key = os.getenv('OPENAI_API_KEY')
@@ -81,6 +161,11 @@ Generate a SQL query that answers this description. Return only the SQL query wi
             # Fallback to mock SQL generation
             mock_sql = generate_mock_sql(er_diagram_data, query_description)
             return jsonify({'sql': mock_sql})
+        
+        if current_user.is_authenticated:
+            qh = QueryHistory(user_id=current_user.id, query=sql_query, description=query_description)
+            db.session.add(qh)
+            db.session.commit()
         
         return jsonify({'sql': sql_query})
         
@@ -431,5 +516,7 @@ def health_check():
     return jsonify({'status': 'healthy', 'message': 'Backend server is running'})
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
+    with app.app_context():
+        db.create_all()
+    port = int(os.environ.get('PORT', 8001))
     app.run(debug=True, host='0.0.0.0', port=port) 
