@@ -7,6 +7,10 @@ import json
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
+import secrets
+import time
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # Load environment variables
 load_dotenv()
@@ -20,12 +24,16 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 
+# Initialize Flask-Limiter
+limiter = Limiter(get_remote_address, app=app, default_limits=["200 per day", "50 per hour"])
+
 # User model
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
     queries = db.relationship('QueryHistory', backref='user', lazy=True)
+    verified = db.Column(db.Boolean, default=False)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -41,11 +49,19 @@ class QueryHistory(db.Model):
     description = db.Column(db.Text, nullable=False)
     timestamp = db.Column(db.DateTime, server_default=db.func.now())
 
+# In-memory store for password reset tokens (for demo only)
+password_reset_tokens = {}  # token: (email, expiry)
+RESET_TOKEN_EXPIRY = 15 * 60  # 15 minutes
+
+# In-memory store for email verification tokens (for demo only)
+email_verification_tokens = {}  # token: email
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
 
 @app.route('/api/signup', methods=['POST'])
+@limiter.limit("5 per minute")
 def signup():
     data = request.get_json()
     email = data.get('email')
@@ -54,20 +70,44 @@ def signup():
         return jsonify({'error': 'Email and password required'}), 400
     if User.query.filter_by(email=email).first():
         return jsonify({'error': 'Email already registered'}), 400
-    user = User(email=email)
+    user = User(email=email, verified=False)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
+    # Generate verification token
+    token = secrets.token_urlsafe(32)
+    email_verification_tokens[token] = email
+    print(f"[Email Verification] Token for {email}: {token}")
     login_user(user)
-    return jsonify({'message': 'Signup successful', 'user': {'id': user.id, 'email': user.email}})
+    return jsonify({'message': 'Signup successful. Please verify your email.', 'user': {'id': user.id, 'email': user.email}, 'verification_required': True})
+
+@app.route('/api/verify-email', methods=['POST'])
+def verify_email():
+    data = request.get_json()
+    token = data.get('token')
+    if not token:
+        return jsonify({'error': 'Verification token required.'}), 400
+    email = email_verification_tokens.get(token)
+    if not email:
+        return jsonify({'error': 'Invalid or expired token.'}), 400
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({'error': 'User not found.'}), 400
+    user.verified = True
+    db.session.commit()
+    del email_verification_tokens[token]
+    return jsonify({'message': 'Email verified successfully.'})
 
 @app.route('/api/login', methods=['POST'])
+@limiter.limit("5 per minute")
 def login():
     data = request.get_json()
     email = data.get('email')
     password = data.get('password')
     user = User.query.filter_by(email=email).first()
     if user and user.check_password(password):
+        if not user.verified:
+            return jsonify({'error': 'Email not verified. Please check your email for the verification link.'}), 403
         login_user(user)
         return jsonify({'message': 'Login successful', 'user': {'id': user.id, 'email': user.email}})
     return jsonify({'error': 'Invalid credentials'}), 401
@@ -95,6 +135,7 @@ def get_history():
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
 @app.route('/api/generate-sql', methods=['POST'])
+@limiter.limit("20 per minute")
 def generate_sql():
     try:
         data = request.get_json()
@@ -511,9 +552,86 @@ LIMIT 10;
 SELECT * FROM table_name LIMIT 10;
 """
 
+@app.route('/api/explain-sql', methods=['POST'])
+@limiter.limit("20 per minute")
+def explain_sql():
+    data = request.get_json()
+    sql = data.get('sql')
+    if not sql:
+        return jsonify({'error': 'SQL is required'}), 400
+    prompt = f"""
+Explain this SQL in plain English.
+
+SQL:
+{sql}
+"""
+    api_key = os.getenv('OPENAI_API_KEY')
+    if not api_key:
+        # Mock explanation
+        return jsonify({'explanation': f'This SQL query does the following: {sql[:60]}...'}), 200
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that explains SQL queries in plain English."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.3
+        )
+        explanation = response.choices[0].message.content if response.choices and response.choices[0].message and response.choices[0].message.content else None
+        if explanation:
+            explanation = explanation.strip()
+        else:
+            explanation = 'No explanation available.'
+        return jsonify({'explanation': explanation})
+    except Exception as e:
+        print(f"OpenAI API error: {str(e)}")
+        return jsonify({'error': 'Failed to explain SQL'}), 500
+
 @app.route('/api/health', methods=['GET'])
 def health_check():
     return jsonify({'status': 'healthy', 'message': 'Backend server is running'})
+
+@app.route('/api/request-password-reset', methods=['POST'])
+@limiter.limit("5 per minute")
+def request_password_reset():
+    data = request.get_json()
+    email = data.get('email')
+    if not email:
+        return jsonify({'error': 'Email is required'}), 400
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({'message': 'If this email is registered, a reset link has been sent.'})
+    token = secrets.token_urlsafe(32)
+    password_reset_tokens[token] = (email, time.time() + RESET_TOKEN_EXPIRY)
+    # Simulate sending email by printing token to console
+    print(f"[Password Reset] Token for {email}: {token}")
+    return jsonify({'message': 'If this email is registered, a reset link has been sent.'})
+
+@app.route('/api/reset-password', methods=['POST'])
+@limiter.limit("5 per minute")
+def reset_password():
+    data = request.get_json()
+    token = data.get('token')
+    new_password = data.get('new_password')
+    if not token or not new_password:
+        return jsonify({'error': 'Token and new password are required.'}), 400
+    entry = password_reset_tokens.get(token)
+    if not entry:
+        return jsonify({'error': 'Invalid or expired token.'}), 400
+    email, expiry = entry
+    if time.time() > expiry:
+        del password_reset_tokens[token]
+        return jsonify({'error': 'Token has expired.'}), 400
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        return jsonify({'error': 'User not found.'}), 400
+    user.set_password(new_password)
+    db.session.commit()
+    del password_reset_tokens[token]
+    return jsonify({'message': 'Password has been reset successfully.'})
 
 if __name__ == '__main__':
     with app.app_context():
